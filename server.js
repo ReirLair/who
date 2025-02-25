@@ -33,7 +33,7 @@ const store = makeInMemoryStore({
   logger: Pino().child({ level: 'silent', stream: 'store' }),
 });
 
-// Helper function to zip the session directory
+// Helper function to zip a directory
 const zipSession = async (sessionPath, sessionZipPath) => {
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(sessionZipPath);
@@ -46,104 +46,89 @@ const zipSession = async (sessionPath, sessionZipPath) => {
   });
 };
 
-// Generates a random session ID
-const generateRandomId = () =>
-  Math.floor(10000000 + Math.random() * 90000000).toString();
-
 // Returns the expected zip file path for a session
 const getSessionZipPath = (sessionName) =>
   path.join(sessionDir, `${sessionName}.zip`);
 
 /**
- * Initialize and start a WhatsApp connection.
- * This version uses the exact session stuff as in your bot script.
+ * Default bot socket using the single "session" directory.
+ * This mirrors your working bot script.
+ * Note: printQRInTerminal is false.
  */
-const startSocket = () => {
-  // In the bot script the session is always stored under 'session'
-  useMultiFileAuthState('session').then(({ state, saveCreds }) => {
-    // Create a new socket instance using your settings
-    const sock = ToxxicTechConnect({
-      logger: Pino({ level: 'silent' }),
-      printQRInTerminal: true,
-      auth: state,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 0,
-      keepAliveIntervalMs: 10000,
-      emitOwnEvents: true,
-      fireInitQueries: true,
-      generateHighQualityLinkPreview: true,
-      syncFullHistory: true,
-      markOnlineOnConnect: true,
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
-    });
+const startDefaultSocket = async () => {
+  const { state, saveCreds } = await useMultiFileAuthState('session');
+  const sock = ToxxicTechConnect({
+    logger: Pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    auth: state,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 0,
+    keepAliveIntervalMs: 10000,
+    emitOwnEvents: true,
+    fireInitQueries: true,
+    generateHighQualityLinkPreview: true,
+    syncFullHistory: true,
+    markOnlineOnConnect: true,
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
+  });
 
-    store.bind(sock.ev);
+  store.bind(sock.ev);
 
-    // Save credentials when updated and zip the session directory
-    sock.ev.on('creds.update', async () => {
-      await saveCreds();
-      const sessionZipPath = getSessionZipPath('session');
-      await zipSession(sessionDir, sessionZipPath);
-      log(`Session saved and zipped for session "session"`);
-    });
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
+    const sessionZipPath = getSessionZipPath('session');
+    await zipSession(sessionDir, sessionZipPath);
+    log(`Session saved and zipped for "session"`);
+  });
 
-    // Handle connection updates and reconnect if necessary
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect } = update;
-      if (connection === 'close') {
-        const shouldReconnect =
-          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        errorLog(`Connection closed. Reconnecting: ${shouldReconnect}`);
-        if (shouldReconnect) startSocket();
-      } else if (connection === 'open') {
-        log(`Successfully connected!`);
-      }
-    });
-
-    // If not registered (i.e. not paired) then request pairing code.
-    if (!sock.authState.creds.registered) {
-      // For the API, we allow a phone number to be passed as a query parameter.
-      // If none is provided, we use CLI input.
-      const phoneNumber =
-        process.env.PHONE ||
-        (() => {
-          const rl = readline.createInterface({
-            input: process.stdin,
-            output: process.stdout,
-          });
-          return new Promise((resolve) => {
-            rl.question('Enter your phone number with country code:\n', (answer) => {
-              rl.close();
-              resolve(answer);
-            });
-          });
-        })();
-      Promise.resolve(phoneNumber).then(async (pn) => {
-        const formattedPhoneNumber = pn.replace(/[^\d]/g, '');
-        let code;
-        try {
-          code = await sock.requestPairingCode(formattedPhoneNumber);
-          code = code.match(/.{1,4}/g)?.join('-') || code;
-          log(`Pairing code: ${code}`);
-        } catch (err) {
-          errorLog(`Error requesting pairing code: ${err.message}`);
-        }
-      });
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === 'close') {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      errorLog(`Connection closed. Reconnecting: ${shouldReconnect}`);
+      if (shouldReconnect) startDefaultSocket();
+    } else if (connection === 'open') {
+      log(`Successfully connected!`);
     }
   });
+
+  // If not paired, request pairing code using CLI input (if PHONE env variable is not set)
+  if (!sock.authState.creds.registered) {
+    const phoneNumber =
+      process.env.PHONE ||
+      (await new Promise((resolve) => {
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+        rl.question('Enter your phone number with country code:\n', (answer) => {
+          rl.close();
+          resolve(answer);
+        });
+      }));
+    const formattedPhoneNumber = phoneNumber.replace(/[^\d]/g, '');
+    try {
+      let code = await sock.requestPairingCode(formattedPhoneNumber);
+      code = code.match(/.{1,4}/g)?.join('-') || code;
+      log(`Pairing code: ${code}`);
+    } catch (err) {
+      errorLog(`Error requesting pairing code: ${err.message}`);
+    }
+  }
+
+  return sock;
 };
 
-// --- API Endpoints ---
-
 /**
- * GET /pair?q=PHONE_NUMBER
+ * API endpoint to request a pairing code.
+ * This endpoint uses a unique session folder per pairing request.
+ * The pairing code is returned along with a download link for the zipped session.
+ * Note: printQRInTerminal is false.
  *
- * This endpoint starts the socket (using the exact session logic from your bot script)
- * and returns a pairing code along with a download link for the session ZIP.
+ * GET /pair?q=PHONE_NUMBER
  */
 app.get('/pair', async (req, res) => {
-  // For this API, we use the same "session" store as your bot script.
-  // The phone number should be passed via the ?q= query.
   const phoneNumber = req.query.q;
   if (!phoneNumber) {
     return res
@@ -152,22 +137,15 @@ app.get('/pair', async (req, res) => {
   }
 
   try {
-    // Generate a random session suffix so that the pairing code can be tied to a specific pairing request.
-    // In the original bot script, the session was simply "session". Here, we allow multiple pairing attempts.
-    const randomId = generateRandomId();
-    const sessionName = `session-${phoneNumber}-${randomId}`;
-    const sessionPath = path.join(sessionDir, sessionName);
-    // Create a unique directory for this pairing session
-    if (!fs.existsSync(sessionPath)) {
-      fs.mkdirSync(sessionPath, { recursive: true });
-      log(`Created session directory: ${sessionName}`);
-    }
+    // Use a unique session folder name for this pairing request.
+    const sessionName = 'session'; // Use the same session as the bot for linking
+    // (Using multiple sessions can lead to linking issues.)
+    const sessionPath = sessionDir; // For our case, we use the same "session" folder.
 
-    // Start a new socket using this specific session directory
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     const sock = ToxxicTechConnect({
       logger: Pino({ level: 'silent' }),
-      printQRInTerminal: true,
+      printQRInTerminal: false,
       auth: state,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 0,
@@ -182,25 +160,34 @@ app.get('/pair', async (req, res) => {
 
     store.bind(sock.ev);
 
-    // Save credentials and zip the session directory when creds update
     sock.ev.on('creds.update', async () => {
       await saveCreds();
       const sessionZipPath = getSessionZipPath(sessionName);
-      await zipSession(sessionPath, sessionZipPath);
-      log(`Session saved and zipped for ${sessionName}`);
+      await zipSession(sessionDir, sessionZipPath);
+      log(`Session saved and zipped for "${sessionName}"`);
     });
 
-    // Handle connection updates and reconnect if necessary
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect } = update;
       if (connection === 'close') {
         const shouldReconnect =
           lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         errorLog(`Connection closed. Reconnecting: ${shouldReconnect}`);
-        if (shouldReconnect) startSocket();
+        if (shouldReconnect) startDefaultSocket();
       } else if (connection === 'open') {
-        log(`Successfully connected for session ${sessionName}`);
+        log(`Successfully connected for session "${sessionName}"`);
       }
+    });
+
+    // Wait for the connection to open before requesting the pairing code.
+    await new Promise((resolve) => {
+      const listener = (update) => {
+        if (update.connection === 'open') {
+          sock.ev.off('connection.update', listener);
+          resolve();
+        }
+      };
+      sock.ev.on('connection.update', listener);
     });
 
     // Retry logic to request a pairing code (up to 3 attempts)
@@ -220,14 +207,12 @@ app.get('/pair', async (req, res) => {
     if (!code)
       throw new Error('Max retries reached. Pairing code generation failed.');
 
-    // Format the code in blocks of 4 characters
     code = code.match(/.{1,4}/g)?.join('-') || code;
-    const downloadLink = `${req.protocol}://${req.get('host')}/session/${sessionName}.zip`;
-
+    const downloadLink = `${req.protocol}://${req.get('host')}/session/session.zip`;
     log(`Pairing code for ${phoneNumber}: ${code}`);
     return res.json({
       pairing_code: code,
-      session_id: sessionName,
+      session_id: 'session',
       session_download: downloadLink,
     });
   } catch (error) {
@@ -239,19 +224,18 @@ app.get('/pair', async (req, res) => {
 });
 
 /**
- * GET /session/:sessionId.zip
+ * API endpoint to download the session ZIP.
  *
- * Endpoint to download the session ZIP file.
+ * GET /session/session.zip
  */
-app.get('/session/:sessionId.zip', (req, res) => {
-  const sessionId = req.params.sessionId;
-  const sessionZipPath = getSessionZipPath(sessionId);
+app.get('/session/session.zip', (req, res) => {
+  const sessionZipPath = getSessionZipPath('session');
   if (!fs.existsSync(sessionZipPath)) {
     return res
       .status(404)
       .json({ error: 'Session not found. Pair first.' });
   }
-  return res.download(sessionZipPath, `${sessionId}.zip`);
+  return res.download(sessionZipPath, 'session.zip');
 });
 
 /**
@@ -259,6 +243,6 @@ app.get('/session/:sessionId.zip', (req, res) => {
  */
 app.listen(PORT, () => {
   log(`API running on port ${PORT}`);
-  // Also start the default bot socket (using the "session" directory)
-  startSocket();
+  // Start the default bot socket (using the "session" directory)
+  startDefaultSocket();
 });
