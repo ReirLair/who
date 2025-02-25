@@ -1,0 +1,34 @@
+{
+  "name": "whatsapp-session-api",
+  "version": "1.0.0",
+  "description": "Express API for WhatsApp session management with Baileys",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "archiver": "^5.3.1",
+    "express": "^4.18.2",
+    "fs-extra": "^11.1.1",
+    "pino": "^8.14.0",
+    "dotenv": "^16.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "session",
+    "express",
+    "api"
+  ],
+  "author": "Reiker",
+  "license": "MIT"
+}
