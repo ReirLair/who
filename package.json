@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Express API for WhatsApp session management with Baileys",
   "main": "index.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
