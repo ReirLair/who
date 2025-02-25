@@ -1,5 +1,5 @@
 import express from 'express';
-import { useMultiFileAuthState, ToxxicTechConnect } from '@whiskeysockets/baileys';
+import { useMultiFileAuthState, makeWASocket, makeInMemoryStore } from '@whiskeysockets/baileys';
 import Pino from 'pino';
 import fs from 'fs-extra';
 import path from 'path';
@@ -16,10 +16,12 @@ fs.ensureDirSync(sessionDir);
 const log = (message) => console.log(`[SESSION-API] → ${message}`);
 const errorLog = (message) => console.error(`[SESSION-API] → ❌ ${message}`);
 
-// Function to generate a random 8-digit number
-const generateRandomId = () => Math.floor(10000000 + Math.random() * 90000000);
+// In-memory store
+const store = makeInMemoryStore({ logger: Pino().child({ level: 'silent', stream: 'store' }) });
 
-// Function to zip session directory
+/**
+ * Function to zip a session directory
+ */
 const zipSession = async (sessionPath, sessionZipPath) => {
     return new Promise((resolve, reject) => {
         const output = fs.createWriteStream(sessionZipPath);
@@ -34,7 +36,65 @@ const zipSession = async (sessionPath, sessionZipPath) => {
     });
 };
 
-// Pairing route: `/pair?q=2347087243475`
+/**
+ * Generates a random session ID
+ */
+const generateRandomId = () => Math.floor(10000000 + Math.random() * 90000000);
+
+/**
+ * Function to initialize and start a WhatsApp connection
+ */
+const startSocket = async (sessionName) => {
+    const userSessionDir = path.join(sessionDir, sessionName);
+    const sessionZipPath = path.join(sessionDir, `${sessionName}.zip`);
+
+    fs.ensureDirSync(userSessionDir);
+
+    const { state, saveCreds } = await useMultiFileAuthState(userSessionDir);
+
+    const sock = makeWASocket({
+        logger: Pino({ level: 'silent' }),
+        auth: state,
+        printQRInTerminal: false,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000,
+        emitOwnEvents: true,
+        fireInitQueries: true,
+        generateHighQualityLinkPreview: true,
+        syncFullHistory: true,
+        markOnlineOnConnect: true,
+        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    });
+
+    store.bind(sock.ev);
+
+    // Save session whenever credentials update
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        await zipSession(userSessionDir, sessionZipPath);
+        log(`Session saved and zipped for ${sessionName}`);
+    });
+
+    // Handle connection updates
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+            errorLog(`Connection closed. Reconnecting: ${shouldReconnect}`);
+            if (shouldReconnect) startSocket(sessionName);
+        } else if (connection === 'open') {
+            log(`Successfully connected for session ${sessionName}`);
+        }
+    });
+
+    return sock;
+};
+
+/**
+ * Route to pair a new WhatsApp session
+ */
 app.get('/pair', async (req, res) => {
     const phoneNumber = req.query.q;
     if (!phoneNumber) {
@@ -44,25 +104,8 @@ app.get('/pair', async (req, res) => {
     try {
         const randomId = generateRandomId();
         const sessionName = `${phoneNumber}-${randomId}`;
-        const userSessionDir = path.join(sessionDir, sessionName);
-        const sessionZipPath = path.join(sessionDir, `${sessionName}.zip`);
 
-        fs.ensureDirSync(userSessionDir);
-
-        const { state, saveCreds } = await useMultiFileAuthState(userSessionDir);
-
-        const sock = ToxxicTechConnect({
-            logger: Pino({ level: 'silent' }),
-            auth: state,
-            browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        });
-
-        sock.ev.on('creds.update', async () => {
-            await saveCreds();
-            await zipSession(userSessionDir, sessionZipPath); // Auto-zip session when paired
-            log(`Session saved and zipped for ${sessionName}`);
-        });
-
+        const sock = await startSocket(sessionName);
         let code = await sock.requestPairingCode(phoneNumber);
         code = code?.match(/.{1,4}/g)?.join('-') || code;
 
@@ -76,7 +119,9 @@ app.get('/pair', async (req, res) => {
     }
 });
 
-// Session download route: `/session/{phoneNumber}-{randomId}.zip`
+/**
+ * Route to download a session as a ZIP file
+ */
 app.get('/session/:sessionId.zip', async (req, res) => {
     const sessionId = req.params.sessionId;
     const sessionZipPath = path.join(sessionDir, `${sessionId}.zip`);
@@ -87,4 +132,7 @@ app.get('/session/:sessionId.zip', async (req, res) => {
     res.download(sessionZipPath, `${sessionId}.zip`);
 });
 
+/**
+ * Start the Express server
+ */
 app.listen(PORT, () => log(`API running on port ${PORT}`));
